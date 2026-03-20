@@ -1,0 +1,9 @@
+apiVersion: akuity.io/v1alpha1
+kind: NamespaceClassChangeRequest
+metadata:
+  name: public-network-approval
+spec:
+  namespaceClassName: public-network
+  recommendationID: rec-xxx
+  approved: true
+  allowHighRisk: false
