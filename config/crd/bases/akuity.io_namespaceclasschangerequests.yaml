@@ -40,6 +40,12 @@ spec:
                 allowHighRisk:
                   type: boolean
                   default: false
+                pullRequestURL:
+                  type: string
+                  description: >
+                    Merged or approved pull request URL authorizing this apply (e.g. GitHub/GitLab PR).
+                    Required when NamespaceClass has annotation namespaceclass.akuity.io/require-pull-request=true
+                    or when the controller runs with NAMESPACECLASS_REQUIRE_PULL_REQUEST_URL set.
             status:
               type: object
               properties:
@@ -51,5 +57,8 @@ spec:
                   type: string
                 appliedSpecSnapshot:
                   type: string
+                appliedPullRequestURL:
+                  type: string
+                  description: pullRequestURL from spec at the time the recommendation was applied (audit)
       subresources:
         status: {}

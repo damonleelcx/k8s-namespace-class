@@ -1,0 +1,6 @@
+apiVersion: akuity.io/v1alpha1
+kind: NamespaceClass
+metadata:
+  name: multi-kind-staging
+spec:
+  resources: []

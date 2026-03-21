@@ -43,6 +43,10 @@ func main() {
 		setupLog.Info("no .env file loaded; using process environment only")
 	}
 
+	if v := os.Getenv("NAMESPACECLASS_REQUIRE_PULL_REQUEST_URL"); v != "" {
+		setupLog.Info("NAMESPACECLASS_REQUIRE_PULL_REQUEST_URL set; NamespaceClassChangeRequest applies require a valid spec.pullRequestURL", "value", v)
+	}
+
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 

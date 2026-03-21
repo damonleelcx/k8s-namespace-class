@@ -7,3 +7,4 @@ spec:
   recommendationID: rec-xxx
   approved: true
   allowHighRisk: false
+  # pullRequestURL: https://github.com/org/repo/pull/1

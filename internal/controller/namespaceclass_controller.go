@@ -11,6 +11,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -41,6 +42,18 @@ const (
 	PrevClassAnnoKey    = "namespaceclass.akuity.io/previous-class"
 	SwitchedAtAnnoKey   = "namespaceclass.akuity.io/switched-at"
 )
+
+// isManagedNonInventoryChild returns true for objects labeled as controller-managed,
+// except the per-namespace inventory ConfigMap (updated every reconcile; watching it would churn).
+func isManagedNonInventoryChild(obj client.Object) bool {
+	if obj == nil || obj.GetLabels()[ManagedLabelKey] != "true" {
+		return false
+	}
+	if cm, ok := obj.(*corev1.ConfigMap); ok && cm.GetName() == InventoryConfigName {
+		return false
+	}
+	return true
+}
 
 type NamespaceClassReconciler struct {
 	client.Client
@@ -90,13 +103,38 @@ func (r *NamespaceClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		DeleteFunc: func(e event.DeleteEvent) bool { return true },
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	managedChildPred := predicate.NewPredicateFuncs(isManagedNonInventoryChild)
+
+	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Namespace{}, builder.WithPredicates(namespacePred)).
 		Watches(&unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "akuity.io/v1alpha1",
 			"kind":       "NamespaceClass",
-		}}, handler.EnqueueRequestsFromMapFunc(r.mapClassToNamespaces), builder.WithPredicates(classPred)).
-		Complete(r)
+		}}, handler.EnqueueRequestsFromMapFunc(r.mapClassToNamespaces), builder.WithPredicates(classPred))
+
+	for _, o := range []client.Object{
+		&corev1.ServiceAccount{},
+		&corev1.ConfigMap{},
+		&corev1.LimitRange{},
+		&corev1.ResourceQuota{},
+		&networkingv1.NetworkPolicy{},
+	} {
+		bldr = bldr.Watches(
+			o,
+			handler.EnqueueRequestsFromMapFunc(r.mapManagedChildToNamespace),
+			builder.WithPredicates(managedChildPred),
+		)
+	}
+
+	return bldr.Complete(r)
+}
+
+func (r *NamespaceClassReconciler) mapManagedChildToNamespace(_ context.Context, obj client.Object) []reconcile.Request {
+	nsName := obj.GetNamespace()
+	if nsName == "" {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: nsName}}}
 }
 
 func (r *NamespaceClassReconciler) mapClassToNamespaces(ctx context.Context, obj client.Object) []reconcile.Request {

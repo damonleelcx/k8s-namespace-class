@@ -1,0 +1,13 @@
+apiVersion: akuity.io/v1alpha1
+kind: NamespaceClassChangeRequest
+metadata:
+  name: multikind-demo-approval
+spec:
+  namespaceClassName: multi-kind-demo
+  recommendationID: rec-41e4436a7e1e
+  approved: true
+  allowHighRisk: false
+  # Required when NamespaceClass has annotation namespaceclass.akuity.io/require-pull-request=true
+  # or when the manager runs with NAMESPACECLASS_REQUIRE_PULL_REQUEST_URL enabled.
+  # Use your real merged PR URL in production; the demo URL below satisfies the http(s) gate.
+  pullRequestURL: https://github.com/example/example/pull/1

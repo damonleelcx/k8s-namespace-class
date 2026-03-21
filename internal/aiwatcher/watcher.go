@@ -305,6 +305,7 @@ func (w *Watcher) askOpenAIForProposal(ctx context.Context, className string, dr
 		"currentResources":  current,
 		"requiredResponse":  `{"summary":"...","diff":[...],"proposedResources":[...]}`,
 		"safetyConstraints": "Do not include Role/ClusterRole/CRD/*Webhook* unless explicitly needed.",
+		"changeProcess":     "Cluster apply of proposals goes through NamespaceClassChangeRequest; teams should commit template updates via git and merge a pull request, then set spec.pullRequestURL on the change request when PR gating is enabled (annotation namespaceclass.akuity.io/require-pull-request or env NAMESPACECLASS_REQUIRE_PULL_REQUEST_URL).",
 	}
 	b, _ := json.Marshal(payload)
 	text, err := w.askOpenAI(ctx, "Given this namespace class drift, return ONLY valid JSON:\n"+string(b))
@@ -497,6 +498,54 @@ func extractSpecField(obj map[string]any) any {
 		return spec
 	}
 	return map[string]any{}
+}
+
+// extractNetworkPolicySpec compares meaningful NetworkPolicy fields with stable ordering
+// so AI drift detection matches the namespace controller’s templates across rule order churn.
+func extractNetworkPolicySpec(obj map[string]any) any {
+	spec, _ := obj["spec"].(map[string]any)
+	if spec == nil {
+		return map[string]any{}
+	}
+	out := map[string]any{}
+	if v, ok := spec["podSelector"]; ok {
+		out["podSelector"] = v
+	}
+	if v, ok := spec["policyTypes"]; ok {
+		out["policyTypes"] = normalizeStringSlice(v)
+	}
+	if v, ok := spec["ingress"]; ok {
+		out["ingress"] = sortJSONStableSlice(v)
+	}
+	if v, ok := spec["egress"]; ok {
+		out["egress"] = sortJSONStableSlice(v)
+	}
+	return out
+}
+
+func sortJSONStableSlice(v any) any {
+	items, ok := v.([]any)
+	if !ok {
+		return []any{}
+	}
+	type pair struct {
+		key string
+		val any
+	}
+	pairs := make([]pair, 0, len(items))
+	for _, item := range items {
+		b, err := json.Marshal(item)
+		if err != nil {
+			continue
+		}
+		pairs = append(pairs, pair{key: string(b), val: item})
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
+	out := make([]any, 0, len(pairs))
+	for _, p := range pairs {
+		out = append(out, p.val)
+	}
+	return out
 }
 
 func normalizeWebhookConfigs(v any) any {

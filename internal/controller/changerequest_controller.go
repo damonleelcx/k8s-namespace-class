@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -15,6 +18,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+const (
+	envRequirePullRequestURL     = "NAMESPACECLASS_REQUIRE_PULL_REQUEST_URL"
+	annotationRequirePullRequest = "namespaceclass.akuity.io/require-pull-request"
 )
 
 type NamespaceClassChangeRequestReconciler struct {
@@ -64,6 +72,10 @@ func (r *NamespaceClassChangeRequestReconciler) Reconcile(ctx context.Context, r
 			return ctrl.Result{}, r.updateChangeRequestStatus(ctx, req.NamespacedName, "Rejected", "NamespaceClass not found", nil)
 		}
 		return ctrl.Result{}, err
+	}
+
+	if msg := pullRequestGateMessage(cr, classObj); msg != "" {
+		return ctrl.Result{}, r.updateChangeRequestStatus(ctx, req.NamespacedName, "Rejected", msg, nil)
 	}
 
 	recs, _, _ := unstructured.NestedSlice(classObj.Object, "status", "recommendations")
@@ -163,12 +175,14 @@ func (r *NamespaceClassChangeRequestReconciler) Reconcile(ctx context.Context, r
 
 	b, _ := json.Marshal(proposed)
 	snapshot := string(b)
+	prURL, _, _ := unstructured.NestedString(cr.Object, "spec", "pullRequestURL")
 	return ctrl.Result{}, r.updateChangeRequestStatus(
 		ctx,
 		req.NamespacedName,
 		"Applied",
 		fmt.Sprintf("Applied recommendation %s to NamespaceClass %s (rolled back %d namespace switch(es))", recommendationID, className, rolledBack),
 		&snapshot,
+		strings.TrimSpace(prURL),
 	)
 }
 
@@ -188,6 +202,7 @@ func (r *NamespaceClassChangeRequestReconciler) updateChangeRequestStatus(
 	phase string,
 	message string,
 	appliedSpecSnapshot *string,
+	appliedPullRequestURL ...string,
 ) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cr, err := r.getChangeRequest(ctx, key)
@@ -200,8 +215,43 @@ func (r *NamespaceClassChangeRequestReconciler) updateChangeRequestStatus(
 		if appliedSpecSnapshot != nil {
 			_ = unstructured.SetNestedField(cr.Object, *appliedSpecSnapshot, "status", "appliedSpecSnapshot")
 		}
+		if len(appliedPullRequestURL) > 0 && appliedPullRequestURL[0] != "" {
+			_ = unstructured.SetNestedField(cr.Object, appliedPullRequestURL[0], "status", "appliedPullRequestURL")
+		}
 		return r.Status().Update(ctx, cr)
 	})
+}
+
+func pullRequestRequiredForClass(classObj *unstructured.Unstructured) bool {
+	v := strings.TrimSpace(os.Getenv(envRequirePullRequestURL))
+	if v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
+		return true
+	}
+	ann := classObj.GetAnnotations()
+	if ann == nil {
+		return false
+	}
+	return ann[annotationRequirePullRequest] == "true"
+}
+
+func pullRequestGateMessage(cr, classObj *unstructured.Unstructured) string {
+	if !pullRequestRequiredForClass(classObj) {
+		return ""
+	}
+	prURL, _, _ := unstructured.NestedString(cr.Object, "spec", "pullRequestURL")
+	if strings.TrimSpace(prURL) == "" {
+		return "spec.pullRequestURL is required when NamespaceClass has annotation namespaceclass.akuity.io/require-pull-request=true or when env NAMESPACECLASS_REQUIRE_PULL_REQUEST_URL is enabled; use the merged pull request URL after Git review"
+	}
+	if !isValidHTTPURL(prURL) {
+		return "spec.pullRequestURL must be a valid http(s) URL (for example the merged GitHub/GitLab pull request)"
+	}
+	return ""
+}
+
+func isValidHTTPURL(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	u, err := url.Parse(raw)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 func (r *NamespaceClassChangeRequestReconciler) updateNamespaceClassStatus(
@@ -251,6 +301,13 @@ func (r *NamespaceClassChangeRequestReconciler) rollbackNamespacesForSwitch(ctx 
 		if prevClass == "" || prevClass == className {
 			continue
 		}
+		skip, err := r.shouldSkipSwitchRollback(ctx, prevClass)
+		if err != nil {
+			return updated, err
+		}
+		if skip {
+			continue
+		}
 		labels := ns.GetLabels()
 		if labels == nil {
 			labels = map[string]string{}
@@ -269,4 +326,27 @@ func (r *NamespaceClassChangeRequestReconciler) rollbackNamespacesForSwitch(ctx 
 		updated++
 	}
 	return updated, nil
+}
+
+// shouldSkipSwitchRollback is true when the previous class is missing or has no spec.resources.
+// Drift demos may hop through an empty placeholder NamespaceClass; rolling namespaces back to
+// that name would strip all managed resources even though the user is "home" on className.
+func (r *NamespaceClassChangeRequestReconciler) shouldSkipSwitchRollback(ctx context.Context, prevClass string) (bool, error) {
+	if prevClass == "" {
+		return true, nil
+	}
+	u := &unstructured.Unstructured{}
+	u.SetAPIVersion("akuity.io/v1alpha1")
+	u.SetKind("NamespaceClass")
+	if err := r.Get(ctx, types.NamespacedName{Name: prevClass}, u); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	res, found, err := unstructured.NestedSlice(u.Object, "spec", "resources")
+	if err != nil || !found {
+		return true, nil
+	}
+	return len(res) == 0, nil
 }

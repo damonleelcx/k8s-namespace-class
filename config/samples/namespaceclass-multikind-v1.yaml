@@ -1,0 +1,17 @@
+apiVersion: akuity.io/v1alpha1
+kind: NamespaceClass
+metadata:
+  name: multi-kind-demo
+spec:
+  resources:
+    - apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: app-runner
+    - apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: class-config
+      data:
+        tier: sandbox
+        profile: v1

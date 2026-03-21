@@ -11,9 +11,12 @@ type compareStrategy struct {
 	extractor compareExtractor
 }
 
+// Ordered matchers for drift extraction (see README "Current field strategies").
+// Unlisted kinds use strategyForKind fallback: full spec.
 var compareStrategies = []compareStrategy{
 	{name: "data", matcher: matchKinds("configmap"), extractor: extractDataField},
 	{name: "data", matcher: matchKinds("secret"), extractor: extractDataField},
+	{name: "networkPolicySpec", matcher: matchKinds("networkpolicy"), extractor: extractNetworkPolicySpec},
 	{name: "rules", matcher: matchKinds("role", "clusterrole"), extractor: extractRulesField},
 	{name: "webhooks", matcher: matchKinds("mutatingwebhookconfiguration", "validatingwebhookconfiguration"), extractor: extractWebhooksField},
 	{name: "serviceAccountFields", matcher: matchKinds("serviceaccount"), extractor: normalizeServiceAccountFields},

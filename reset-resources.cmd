@@ -4,7 +4,12 @@ setlocal
 echo ==> Deleting sample resources
 kubectl delete -f config/samples/namespaceclass-change-request.yaml --ignore-not-found
 kubectl delete -f config/samples/namespaceclass-change-request-internal.yaml --ignore-not-found
+kubectl delete -f config/samples/namespaceclass-change-request-multikind.yaml --ignore-not-found
 kubectl delete -f config/samples/namespace-web-portal.yaml --ignore-not-found
+kubectl delete -f config/samples/namespace-app-sandbox.yaml --ignore-not-found
+kubectl delete -f config/samples/namespaceclass-multikind-v2.yaml --ignore-not-found
+kubectl delete -f config/samples/namespaceclass-multikind-staging.yaml --ignore-not-found
+kubectl delete -f config/samples/namespaceclass-multikind-v1.yaml --ignore-not-found
 kubectl delete -f config/samples/namespaceclass-public-internal.yaml --ignore-not-found
 
 echo ==> Deleting CRDs (and all related custom resources)
@@ -15,11 +20,15 @@ echo ==> Optional force cleanup in demo namespace
 kubectl -n web-portal delete configmap namespaceclass-inventory --ignore-not-found
 kubectl -n web-portal delete networkpolicy allow-public-ingress allow-vpn-only --ignore-not-found
 kubectl delete namespace web-portal --ignore-not-found
+kubectl delete namespace app-sandbox --ignore-not-found
 
 echo ==> Verifying cleanup
-kubectl get namespaceclass
-kubectl get namespaceclasschangerequest
-kubectl get ns web-portal
+kubectl get namespaceclass 2>nul
+if errorlevel 1 echo (skip: NamespaceClass API unavailable after CRD delete)
+kubectl get namespaceclasschangerequest 2>nul
+if errorlevel 1 echo (skip: NamespaceClassChangeRequest API unavailable after CRD delete)
+kubectl get ns web-portal 2>nul
+if errorlevel 1 echo (web-portal namespace not found — expected if deleted)
 
 echo Reset complete.
 endlocal
