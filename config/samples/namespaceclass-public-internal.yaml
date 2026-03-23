@@ -20,6 +20,8 @@ apiVersion: akuity.io/v1alpha1
 kind: NamespaceClass
 metadata:
   name: internal-network
+  annotations:
+    namespaceclass.akuity.io/switch-drift-mode: suggest-rollback-to-previous
 spec:
   resources:
     - apiVersion: networking.k8s.io/v1

@@ -105,17 +105,17 @@ The watcher performs real object-level comparison for each namespace using a cla
 
 The registry in `internal/aiwatcher/compare_strategy.go` applies **per Kind**. Anything in `spec.resources` is analyzed; below are the kinds with **custom** normalization (everything else uses the **default**: whole `spec`).
 
-| Kind | What the AI compares (normalized) |
-| --- | --- |
-| `ServiceAccount` | `automountServiceAccountToken`, `imagePullSecrets`, `secrets` |
-| `ConfigMap` | `data`, `binaryData` |
-| `Secret` | `data`, `binaryData` |
-| `LimitRange` | `spec.limits` (selected keys, stable order) |
-| `ResourceQuota` | `spec.hard`, `spec.scopes`, `spec.scopeSelector` |
-| `NetworkPolicy` | `podSelector`, `policyTypes`, `ingress`, `egress` (rules stable-sorted) |
-| `Role` / `ClusterRole` | `rules` |
-| `MutatingWebhookConfiguration` / `ValidatingWebhookConfiguration` | selected `webhooks` fields |
-| **Any other Kind** (e.g. `PodDisruptionBudget`, `Service`, CRDs you allow) | entire `spec` as JSON-shaped structure |
+| Kind                                                                       | What the AI compares (normalized)                                       |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `ServiceAccount`                                                           | `automountServiceAccountToken`, `imagePullSecrets`, `secrets`           |
+| `ConfigMap`                                                                | `data`, `binaryData`                                                    |
+| `Secret`                                                                   | `data`, `binaryData`                                                    |
+| `LimitRange`                                                               | `spec.limits` (selected keys, stable order)                             |
+| `ResourceQuota`                                                            | `spec.hard`, `spec.scopes`, `spec.scopeSelector`                        |
+| `NetworkPolicy`                                                            | `podSelector`, `policyTypes`, `ingress`, `egress` (rules stable-sorted) |
+| `Role` / `ClusterRole`                                                     | `rules`                                                                 |
+| `MutatingWebhookConfiguration` / `ValidatingWebhookConfiguration`          | selected `webhooks` fields                                              |
+| **Any other Kind** (e.g. `PodDisruptionBudget`, `Service`, CRDs you allow) | entire `spec` as JSON-shaped structure                                  |
 
 #### PodSecurityPolicy
 
@@ -187,12 +187,12 @@ When enabled, watcher polls classes and namespaces, detects drift, asks OpenAI f
 
 ### Test scripts
 
-| Script (Bash) | Script (Windows `cmd`) | What it runs |
-| --- | --- | --- |
-| `./test-flow-networkpolicy.sh` | `test-flow-networkpolicy.cmd` | `web-portal` + `public-network` / `internal-network` NetworkPolicies, class switching, AI recommendations, and `NamespaceClassChangeRequest` approval (requires controller with `OPENAI_API_KEY`). |
-| `./test-flow-multikind.sh` | `test-flow-multikind.cmd` | `app-sandbox` + `multi-kind-demo` class: `ServiceAccount` + `ConfigMap`, then a **NamespaceClass spec upgrade** (adds `LimitRange`, updates `ConfigMap` data), then deletes the managed `ServiceAccount` to show reconcile recreate. No AI approval steps. |
-| `./test-flow-multikind-ai.sh` | `test-flow-multikind-ai.cmd` | Same class/namespace as above, but drives the **AI drift → recommendation → `NamespaceClassChangeRequest`** loop with **pull request gating**. Uses a **class label switch** (`multi-kind-demo` ↔ `multi-kind-staging`) so drift survives the next watcher tick (deleting a managed `ServiceAccount` is reconciled too fast for a reliable AI demo). Pauses for you to paste `recommendationID` into `config/samples/namespaceclass-change-request-multikind.yaml`. |
-| `./test-flow.sh` | `test-flow.cmd` | Convenience wrapper; same as the NetworkPolicy script above. |
+| Script (Bash)                  | Script (Windows `cmd`)        | What it runs                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------ | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `./test-flow-networkpolicy.sh` | `test-flow-networkpolicy.cmd` | `web-portal` + `public-network` / `internal-network` NetworkPolicies, class switching, AI recommendations, and `NamespaceClassChangeRequest` approval (requires controller with `OPENAI_API_KEY`).                                                                                                                                                                                                              |
+| `./test-flow-multikind.sh`     | `test-flow-multikind.cmd`     | `app-sandbox` + `multi-kind-demo` class: `ServiceAccount` + `ConfigMap`, then a **NamespaceClass spec upgrade** (adds `LimitRange`, updates `ConfigMap` data), then deletes the managed `ServiceAccount` to show reconcile recreate. No AI approval steps.                                                                                                                                                      |
+| `./test-flow-multikind-ai.sh`  | `test-flow-multikind-ai.cmd`  | Same class/namespace as above, but drives the **AI drift → recommendation → `NamespaceClassChangeRequest`** loop with **pull request gating**. Enables short `ai-drift-hold-seconds`, then mutates `ConfigMap` + deletes managed `ServiceAccount` to produce stable drift and recovery proposal. Pauses for you to paste `recommendationID` into `config/samples/namespaceclass-change-request-multikind.yaml`. |
+| `./test-flow.sh`               | `test-flow.cmd`               | Convenience wrapper; same as the NetworkPolicy script above.                                                                                                                                                                                                                                                                                                                                                    |
 
 The numbered steps **1–7** below mirror `./test-flow-networkpolicy.sh` / `test-flow-networkpolicy.cmd` (that script pauses for you to paste recommendation IDs into the sample YAML files).
 
@@ -222,6 +222,16 @@ kubectl apply -f config/samples/namespace-web-portal.yaml
 
 For example, delete a managed policy in `web-portal`:
 
+Optional (recommended for demo stability): pause namespace auto-heal briefly so watcher can
+consistently capture drift before resources are reconciled back.
+
+```bash
+kubectl annotate namespaceclass public-network namespaceclass.akuity.io/ai-drift-hold-seconds=45 --overwrite
+```
+
+`ai-drift-hold-seconds` is one-shot per class switch: after the hold window expires, auto-heal resumes
+and will not keep extending the hold indefinitely.
+
 ```bash
 kubectl -n web-portal delete networkpolicy allow-public-ingress
 ```
@@ -232,6 +242,7 @@ No manual trigger is needed in current implementation. Watcher continuously chec
 
 ```bash
 kubectl get namespaceclass public-network -o yaml
+kubectl -n web-portal get networkpolicy allow-public-ingress
 ```
 
 You should see:
@@ -288,6 +299,17 @@ Expected result after reconcile:
 - `allow-public-ingress` is deleted (old class resource).
 - `allow-vpn-only` exists (new class resource).
 - For up to 10 minutes after switch, AI watcher reports a switch drift on the new class (so you can review/approve it).
+
+Switch recommendation strategy:
+
+```bash
+# sample defaults to rollback-oriented recommendation (suggest previous class resources)
+# because config/samples/namespaceclass-public-internal.yaml sets this annotation:
+kubectl annotate namespaceclass internal-network namespaceclass.akuity.io/switch-drift-mode=suggest-rollback-to-previous --overwrite
+
+# optional override if you want recommendation to keep current class template instead:
+kubectl annotate namespaceclass internal-network namespaceclass.akuity.io/switch-drift-mode=confirm-current-class --overwrite
+```
 
 Wait for watcher analysis on `internal-network`:
 
@@ -375,6 +397,9 @@ kubectl -n app-sandbox get limitrange
 kubectl apply -f config/samples/namespaceclass-multikind-v2.yaml
 ```
 
+This step is a normal class upgrade and should reconcile directly; by itself it does **not** create AI drift recommendation.
+If you want AI to recommend changing configuration back to class template, continue with [Multi-kind + AI watcher + pull request gate](#multi-kind--ai-watcher--pull-request-gate).
+
 4. After reconcile, expect `profile=v2`, new `data.note`, and `LimitRange` `mem-limit-range`:
 
 ```bash
@@ -399,7 +424,6 @@ This extends the same `multi-kind-demo` / `app-sandbox` setup to exercise **drif
 1. Apply CRDs, `namespaceclass-multikind-v1.yaml`, and `namespace-app-sandbox.yaml` (same as steps above). Wait until `profile=v1` and `ServiceAccount` `app-runner` exist.
 
 2. **Enable PR gating** for this class (pick one):
-
    - Per class:
 
      ```bash
@@ -408,16 +432,13 @@ This extends the same `multi-kind-demo` / `app-sandbox` setup to exercise **drif
 
    - Or cluster-wide: start the manager with `NAMESPACECLASS_REQUIRE_PULL_REQUEST_URL` set to `1`, `true`, or `yes`.
 
-3. **Create drift** the watcher can see for more than a moment. **Do not rely on deleting** a managed `ServiceAccount` here: the namespace controller recreates it on the next reconcile, so the AI watcher often sees **no drift** on its polling interval. Instead, use a short **class switch** (same mechanism as [§7](#7-switch-between-networks-public---internal)): apply an empty staging class, relabel the namespace away and back so `app-sandbox` keeps `namespaceclass.akuity.io/previous-class` / `namespaceclass.akuity.io/switched-at` while labeled `multi-kind-demo` again.
+3. **Create drift** the same way as NetworkPolicy flow: temporarily hold auto-heal, then mutate/delete managed objects so watcher can recommend restoring the class template.
 
    ```bash
-   kubectl apply -f config/samples/namespaceclass-multikind-staging.yaml
-   kubectl label namespace app-sandbox namespaceclass.akuity.io/name=multi-kind-staging --overwrite
-   sleep 3
-   kubectl label namespace app-sandbox namespaceclass.akuity.io/name=multi-kind-demo --overwrite
+   kubectl annotate namespaceclass multi-kind-demo namespaceclass.akuity.io/ai-drift-hold-seconds=45 --overwrite
+   kubectl -n app-sandbox patch configmap class-config --type merge -p '{"data":{"profile":"tampered-v0","note":"manual-drift"}}'
+   kubectl -n app-sandbox delete serviceaccount app-runner
    ```
-
-   Wait until `app-runner` and `class-config` (`profile=v1`) exist again, then continue.
 
 4. Poll until the class has a pending recommendation (same `jsonpath` caveats as [§5 Approve recommendation](#5-approve-recommendation) on Windows):
 
@@ -438,17 +459,16 @@ This extends the same `multi-kind-demo` / `app-sandbox` setup to exercise **drif
    kubectl apply -f config/samples/namespaceclass-change-request-multikind.yaml
    ```
 
-6. Confirm `status.phase` is `Applied`, `status.appliedPullRequestURL` is recorded, `NamespaceClass.spec.resources` reflects the approved proposal, and `app-runner` still exists:
+6. Confirm `status.phase` is `Applied`, `status.appliedPullRequestURL` is recorded, `NamespaceClass.spec.resources` reflects the approved proposal, and managed objects are restored from class template (`profile=v1`, `app-runner` exists):
 
    ```bash
    kubectl get namespaceclasschangerequest multikind-demo-approval -o yaml
    kubectl get namespaceclass multi-kind-demo -o yaml
    kubectl -n app-sandbox get serviceaccount app-runner
+   kubectl -n app-sandbox get configmap class-config -o jsonpath='{.data.profile}{"\n"}'
    ```
 
 **Note:** The model’s `proposedResources` may differ slightly from the checked-in v1 YAML; the approval controller still replaces `spec.resources` with the recommendation. If the change request is `Rejected`, check `status.message` (e.g. high-risk kinds, bad `pullRequestURL`, or `recommendationID` mismatch).
-
-When a change request is applied, the controller may **roll back namespace labels** to `namespaceclass.akuity.io/previous-class` (see the internal/public NetworkPolicy flow). If your drift demo used an **empty** placeholder class (e.g. `multi-kind-staging` with `spec.resources: []`), that rollback is **skipped** so the namespace stays on `multi-kind-demo` and managed objects are not stripped.
 
 Automated version: `./test-flow-multikind.sh` or `test-flow-multikind.cmd` (spec upgrade + drift recreate only). For AI + PR gate: `./test-flow-multikind-ai.sh` or `test-flow-multikind-ai.cmd` (requires `OPENAI_API_KEY` in the environment **for the script’s preflight check** and in the environment where you run the manager).
 

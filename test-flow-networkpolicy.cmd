@@ -86,7 +86,12 @@ kubectl -n web-portal get networkpolicy allow-vpn-only -o yaml
 timeout /t 2 /nobreak >nul
 
 echo.
-echo ==> Create drift by deleting allow-public-ingress
+echo ==> Hold auto-heal briefly so watcher can capture drift
+kubectl annotate namespaceclass public-network namespaceclass.akuity.io/ai-drift-hold-seconds=45 --overwrite
+timeout /t 2 /nobreak >nul
+
+echo.
+echo ==> Delete allow-public-ingress after hold is enabled
 kubectl -n web-portal delete networkpolicy allow-public-ingress
 timeout /t 2 /nobreak >nul
 

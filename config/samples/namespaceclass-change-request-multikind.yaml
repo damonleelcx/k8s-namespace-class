@@ -4,7 +4,7 @@ metadata:
   name: multikind-demo-approval
 spec:
   namespaceClassName: multi-kind-demo
-  recommendationID: rec-41e4436a7e1e
+  recommendationID: rec-xxx
   approved: true
   allowHighRisk: false
   # Required when NamespaceClass has annotation namespaceclass.akuity.io/require-pull-request=true

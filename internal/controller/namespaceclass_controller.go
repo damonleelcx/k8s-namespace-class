@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +42,12 @@ const (
 	LastClassAnnoKey    = "namespaceclass.akuity.io/last-class"
 	PrevClassAnnoKey    = "namespaceclass.akuity.io/previous-class"
 	SwitchedAtAnnoKey   = "namespaceclass.akuity.io/switched-at"
+	// AIDriftHoldSecondsAnnoKey delays auto-heal to let AI watcher capture drift first.
+	// Default behavior is unchanged unless this annotation is explicitly set on NamespaceClass.
+	AIDriftHoldSecondsAnnoKey = "namespaceclass.akuity.io/ai-drift-hold-seconds"
+	AutoHealHeldCondType      = "AutoHealHeld"
+	driftHoldUntilAnnoKey     = "namespaceclass.akuity.io/ai-drift-hold-until"
+	driftHoldUsedAnnoKey      = "namespaceclass.akuity.io/ai-drift-hold-used"
 )
 
 // isManagedNonInventoryChild returns true for objects labeled as controller-managed,
@@ -63,6 +70,11 @@ type NamespaceClassReconciler struct {
 
 type namespaceClassSpec struct {
 	Resources []json.RawMessage `json:"resources,omitempty"`
+}
+
+type classBehavior struct {
+	allowHighRisk bool
+	driftHold     time.Duration
 }
 
 type resourceRef struct {
@@ -162,7 +174,7 @@ func (r *NamespaceClassReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	desiredRefs := []resourceRef{}
 
 	if desiredClass != "" {
-		classSpec, allowHighRisk, err := r.getNamespaceClassSpec(ctx, desiredClass)
+		classSpec, behavior, err := r.getNamespaceClassSpec(ctx, desiredClass)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				logger.Info("namespace references missing NamespaceClass; deleting managed resources", "class", desiredClass)
@@ -170,7 +182,19 @@ func (r *NamespaceClassReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
 		} else {
-			desiredRefs, err = r.applyClassResources(ctx, &ns, desiredClass, classSpec.Resources, allowHighRisk)
+			if holdActive, waitFor, holdErr := r.shouldHoldAutoHeal(ctx, &ns, desiredClass, classSpec.Resources, behavior.driftHold); holdErr != nil {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, holdErr
+			} else if holdActive {
+				_ = r.setClassAutoHealHeldCondition(ctx, desiredClass, true, "HoldWindowActive", "Auto-heal held for AI drift review")
+				if err := r.updateSwitchAnnotations(ctx, &ns); err != nil {
+					return ctrl.Result{RequeueAfter: 5 * time.Second}, err
+				}
+				// Keep reconciliation alive while hold mode is active for this namespace.
+				return ctrl.Result{RequeueAfter: waitFor}, nil
+			}
+			_ = r.setClassAutoHealHeldCondition(ctx, desiredClass, false, "HoldWindowInactive", "Auto-heal running normally")
+
+			desiredRefs, err = r.applyClassResources(ctx, &ns, desiredClass, classSpec.Resources, behavior.allowHighRisk)
 			if err != nil {
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 			}
@@ -222,27 +246,231 @@ func (r *NamespaceClassReconciler) updateSwitchAnnotations(ctx context.Context, 
 	return r.Update(ctx, ns)
 }
 
-func (r *NamespaceClassReconciler) getNamespaceClassSpec(ctx context.Context, className string) (*namespaceClassSpec, bool, error) {
+func (r *NamespaceClassReconciler) getNamespaceClassSpec(ctx context.Context, className string) (*namespaceClassSpec, classBehavior, error) {
 	u := &unstructured.Unstructured{}
 	u.SetAPIVersion("akuity.io/v1alpha1")
 	u.SetKind("NamespaceClass")
 	if err := r.Get(ctx, types.NamespacedName{Name: className}, u); err != nil {
-		return nil, false, err
+		return nil, classBehavior{}, err
 	}
 	allowHighRisk := u.GetAnnotations()["namespaceclass.akuity.io/allow-high-risk"] == "true"
+	driftHold := parseDriftHoldSeconds(u.GetAnnotations()[AIDriftHoldSecondsAnnoKey])
 	specMap, found, err := unstructured.NestedMap(u.Object, "spec")
 	if err != nil || !found {
-		return &namespaceClassSpec{}, allowHighRisk, err
+		return &namespaceClassSpec{}, classBehavior{
+			allowHighRisk: allowHighRisk,
+			driftHold:     driftHold,
+		}, err
 	}
 	specRaw, err := json.Marshal(specMap)
 	if err != nil {
-		return nil, false, err
+		return nil, classBehavior{}, err
 	}
 	var spec namespaceClassSpec
 	if err := json.Unmarshal(specRaw, &spec); err != nil {
-		return nil, false, err
+		return nil, classBehavior{}, err
 	}
-	return &spec, allowHighRisk, nil
+	return &spec, classBehavior{
+		allowHighRisk: allowHighRisk,
+		driftHold:     driftHold,
+	}, nil
+}
+
+func parseDriftHoldSeconds(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	sec, err := strconv.Atoi(raw)
+	if err != nil || sec <= 0 {
+		return 0
+	}
+	return time.Duration(sec) * time.Second
+}
+
+func (r *NamespaceClassReconciler) shouldHoldAutoHeal(
+	ctx context.Context,
+	ns *corev1.Namespace,
+	className string,
+	resources []json.RawMessage,
+	holdWindow time.Duration,
+) (bool, time.Duration, error) {
+	if holdWindow <= 0 {
+		r.clearDriftHoldAnnotations(ns)
+		return false, 0, nil
+	}
+	drift, err := r.hasTemplateDrift(ctx, ns.Name, resources)
+	if err != nil {
+		return false, 0, err
+	}
+	if !drift {
+		r.clearDriftHoldAnnotations(ns)
+		if err := r.Update(ctx, ns); err != nil {
+			return false, 0, err
+		}
+		return false, 0, nil
+	}
+
+	ann := ns.GetAnnotations()
+	if ann == nil {
+		ann = map[string]string{}
+	}
+	if untilRaw := strings.TrimSpace(ann[driftHoldUntilAnnoKey]); untilRaw != "" {
+		if until, err := time.Parse(time.RFC3339, untilRaw); err == nil {
+			remain := time.Until(until)
+			if remain > 0 {
+				return true, minDuration(remain, 15*time.Second), nil
+			}
+		}
+	}
+
+	// One-shot hold: after first hold window expires, auto-heal resumes.
+	if ann[driftHoldUsedAnnoKey] == "true" {
+		return false, 0, nil
+	}
+	ann[driftHoldUntilAnnoKey] = time.Now().Add(holdWindow).Format(time.RFC3339)
+	ann[driftHoldUsedAnnoKey] = "true"
+	ns.SetAnnotations(ann)
+	if err := r.Update(ctx, ns); err != nil {
+		return false, 0, err
+	}
+	return true, minDuration(holdWindow, 15*time.Second), nil
+}
+
+func (r *NamespaceClassReconciler) classHasPendingRecommendation(ctx context.Context, className string) (bool, error) {
+	u := &unstructured.Unstructured{}
+	u.SetAPIVersion("akuity.io/v1alpha1")
+	u.SetKind("NamespaceClass")
+	if err := r.Get(ctx, types.NamespacedName{Name: className}, u); err != nil {
+		return false, err
+	}
+	recs, found, err := unstructured.NestedSlice(u.Object, "status", "recommendations")
+	if err != nil || !found {
+		return false, err
+	}
+	for _, rec := range recs {
+		m, ok := rec.(map[string]any)
+		if !ok {
+			continue
+		}
+		status, _ := m["status"].(string)
+		if strings.EqualFold(status, "Pending") || strings.TrimSpace(status) == "" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *NamespaceClassReconciler) clearDriftHoldAnnotations(ns *corev1.Namespace) {
+	ann := ns.GetAnnotations()
+	if ann == nil {
+		return
+	}
+	delete(ann, driftHoldUntilAnnoKey)
+	if ns.GetLabels()[ClassLabelKey] != ann[LastClassAnnoKey] {
+		// Keep used marker for current class so hold is one-shot until label changes.
+		delete(ann, driftHoldUsedAnnoKey)
+	}
+	ns.SetAnnotations(ann)
+}
+
+func (r *NamespaceClassReconciler) setClassAutoHealHeldCondition(
+	ctx context.Context,
+	className string,
+	active bool,
+	reason string,
+	message string,
+) error {
+	u := &unstructured.Unstructured{}
+	u.SetAPIVersion("akuity.io/v1alpha1")
+	u.SetKind("NamespaceClass")
+	if err := r.Get(ctx, types.NamespacedName{Name: className}, u); err != nil {
+		return err
+	}
+	now := metav1.Now().Format(time.RFC3339)
+	status := "False"
+	if active {
+		status = "True"
+	}
+	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	updated := false
+	for i := range conds {
+		cm, ok := conds[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		if cm["type"] == AutoHealHeldCondType {
+			cm["status"] = status
+			cm["reason"] = reason
+			cm["message"] = message
+			cm["lastTransitionTime"] = now
+			conds[i] = cm
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		conds = append(conds, map[string]any{
+			"type":               AutoHealHeldCondType,
+			"status":             status,
+			"reason":             reason,
+			"message":            message,
+			"lastTransitionTime": now,
+		})
+	}
+	if err := unstructured.SetNestedSlice(u.Object, conds, "status", "conditions"); err != nil {
+		return err
+	}
+	return r.Status().Update(ctx, u)
+}
+
+func (r *NamespaceClassReconciler) hasTemplateDrift(ctx context.Context, namespace string, resources []json.RawMessage) (bool, error) {
+	for _, resRaw := range resources {
+		var obj map[string]any
+		if err := json.Unmarshal(resRaw, &obj); err != nil {
+			return false, fmt.Errorf("invalid resource template JSON: %w", err)
+		}
+		u := &unstructured.Unstructured{Object: obj}
+		if u.GetAPIVersion() == "" || u.GetKind() == "" || u.GetName() == "" {
+			continue
+		}
+		gvk := u.GroupVersionKind()
+		mapping, err := r.mapper.RESTMapping(schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind}, gvk.Version)
+		if err != nil {
+			return false, err
+		}
+		resourceClient := r.dynClient.Resource(mapping.Resource)
+		var readClient dynamic.ResourceInterface = resourceClient
+		if mapping.Scope.Name() == "namespace" {
+			readClient = resourceClient.Namespace(namespace)
+		}
+		actual, err := readClient.Get(ctx, u.GetName(), metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		desiredSpec, _, _ := unstructured.NestedMap(u.Object, "spec")
+		actualSpec, _, _ := unstructured.NestedMap(actual.Object, "spec")
+		if !mapsEqualCanonical(desiredSpec, actualSpec) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func mapsEqualCanonical(a, b map[string]any) bool {
+	ab, _ := json.Marshal(a)
+	bb, _ := json.Marshal(b)
+	return string(ab) == string(bb)
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (r *NamespaceClassReconciler) applyClassResources(ctx context.Context, ns *corev1.Namespace, className string, resources []json.RawMessage, allowHighRisk bool) ([]resourceRef, error) {

@@ -101,6 +101,8 @@ run_step "Re-check allow-vpn-only details" \
   kubectl -n web-portal get networkpolicy allow-vpn-only -o yaml
 
 run_step "Create drift by deleting allow-public-ingress" \
+  kubectl annotate namespaceclass public-network namespaceclass.akuity.io/ai-drift-hold-seconds=45 --overwrite
+run_step "Delete allow-public-ingress after hold is enabled" \
   kubectl -n web-portal delete networkpolicy allow-public-ingress
 run_step "Wait for watcher analysis on public-network" \
   kubectl get namespaceclass public-network -o yaml

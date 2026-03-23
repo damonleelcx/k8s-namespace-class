@@ -50,30 +50,24 @@ kubectl annotate namespaceclass multi-kind-demo namespaceclass.akuity.io/require
 timeout /t 2 /nobreak >nul
 
 echo.
+echo ==> Hold auto-heal briefly so watcher can capture drift
+kubectl annotate namespaceclass multi-kind-demo namespaceclass.akuity.io/ai-drift-hold-seconds=45 --overwrite
+timeout /t 2 /nobreak >nul
+
+echo.
 echo ==> Show class before drift
 kubectl get namespaceclass multi-kind-demo -o yaml
 timeout /t 2 /nobreak >nul
 
-REM Deleting a managed ServiceAccount is healed immediately by the namespace controller, so the AI
-REM watcher often never sees drift. Switch class twice to record switch annotations (see README §7).
 echo.
-echo ==> Apply empty staging NamespaceClass (for label switch only)
-kubectl apply -f config/samples/namespaceclass-multikind-staging.yaml
+echo ==> Create drift: patch ConfigMap profile away from class template
+kubectl -n app-sandbox patch configmap class-config --type merge -p "{\"data\":{\"profile\":\"tampered-v0\",\"note\":\"manual-drift\"}}"
 timeout /t 2 /nobreak >nul
 
 echo.
-echo ==> Switch app-sandbox to multi-kind-staging (strips demo resources)
-kubectl label namespace app-sandbox namespaceclass.akuity.io/name=multi-kind-staging --overwrite
+echo ==> Create drift: delete managed ServiceAccount
+kubectl -n app-sandbox delete serviceaccount app-runner --wait=true
 timeout /t 2 /nobreak >nul
-timeout /t 2 /nobreak >nul
-
-echo.
-echo ==> Switch app-sandbox back to multi-kind-demo (recreates SA/CM; leaves switch drift ~10m)
-kubectl label namespace app-sandbox namespaceclass.akuity.io/name=multi-kind-demo --overwrite
-timeout /t 2 /nobreak >nul
-
-call :wait_multikind_v1
-if errorlevel 1 exit /b 1
 
 echo.
 echo ==> Hint: watcher status (expect DriftDetected / recommendation soon)

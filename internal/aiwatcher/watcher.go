@@ -38,6 +38,17 @@ type Watcher struct {
 
 const switchDriftWindow = 10 * time.Minute
 
+const (
+	switchDriftModeAnnotation = "namespaceclass.akuity.io/switch-drift-mode"
+	switchModeConfirmCurrent  = "confirm-current-class"
+	switchModeSuggestRollback = "suggest-rollback-to-previous"
+)
+
+type switchDriftHint struct {
+	namespace string
+	prevClass string
+}
+
 func New(cfg *rest.Config, interval time.Duration) *Watcher {
 	return &Watcher{
 		dynClient:  dynamic.NewForConfigOrDie(cfg),
@@ -85,8 +96,9 @@ func (w *Watcher) listNamespaceClasses(ctx context.Context) (*unstructured.Unstr
 func (w *Watcher) reconcileClass(ctx context.Context, classObj *unstructured.Unstructured) error {
 	className := classObj.GetName()
 	currentResources := readSpecResources(classObj)
+	switchMode := readSwitchDriftMode(classObj)
 
-	drift, err := w.detectDrift(ctx, className, currentResources)
+	drift, hints, err := w.detectDrift(ctx, className, currentResources)
 	if err != nil {
 		return err
 	}
@@ -104,12 +116,19 @@ func (w *Watcher) reconcileClass(ctx context.Context, classObj *unstructured.Uns
 		return w.writeClassStatus(ctx, classObj, "", nil, currentResources, false)
 	}
 
-	proposal, err := w.askOpenAIForProposal(ctx, className, drift, currentResources)
+	proposedResources := currentResources
+	if switchMode == switchModeSuggestRollback {
+		if rollbackResources, ok := w.rollbackProposalResources(ctx, hints); ok {
+			proposedResources = rollbackResources
+		}
+	}
+
+	proposal, err := w.askOpenAIForProposal(ctx, className, drift, proposedResources)
 	if err != nil {
 		return err
 	}
 	if len(proposal.ProposedResources) == 0 {
-		proposal.ProposedResources = currentResources
+		proposal.ProposedResources = proposedResources
 	}
 	return w.writeClassStatus(ctx, classObj, proposal.Summary, proposal.Diff, proposal.ProposedResources, true)
 }
@@ -126,23 +145,27 @@ func buildAnalysisDigest(currentResources []any, drift []string) (string, error)
 	return sha(b), nil
 }
 
-func (w *Watcher) detectDrift(ctx context.Context, className string, current []any) ([]string, error) {
+func (w *Watcher) detectDrift(ctx context.Context, className string, current []any) ([]string, []switchDriftHint, error) {
 	nsList, err := w.dynClient.Resource(schema.GroupVersionResource{Version: "v1", Resource: "namespaces"}).List(ctx, metav1.ListOptions{
 		LabelSelector: "namespaceclass.akuity.io/name=" + className,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	templates, err := buildTemplateTargetsForWatcher(w, current)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	desired := toResourceRefKeys(current)
 	drift := []string{}
+	hints := []switchDriftHint{}
 	for _, ns := range nsList.Items {
 		nsName := ns.GetName()
-		if switchDrift := buildSwitchDriftMessage(&ns, className); switchDrift != "" {
+		if switchDrift, hint := buildSwitchDriftMessage(&ns, className); switchDrift != "" {
 			drift = append(drift, switchDrift)
+			if hint != nil {
+				hints = append(hints, *hint)
+			}
 		}
 		for _, tpl := range templates {
 			resourceClient := w.dynClient.Resource(tpl.resource)
@@ -202,33 +225,69 @@ func (w *Watcher) detectDrift(ctx context.Context, className string, current []a
 		}
 	}
 	sort.Strings(drift)
-	return drift, nil
+	return drift, hints, nil
 }
 
-func buildSwitchDriftMessage(ns *unstructured.Unstructured, className string) string {
+func buildSwitchDriftMessage(ns *unstructured.Unstructured, className string) (string, *switchDriftHint) {
 	ann := ns.GetAnnotations()
 	if ann == nil {
-		return ""
+		return "", nil
 	}
 	prevClass := strings.TrimSpace(ann["namespaceclass.akuity.io/previous-class"])
 	switchedAt := strings.TrimSpace(ann["namespaceclass.akuity.io/switched-at"])
 	if prevClass == "" || prevClass == className || switchedAt == "" {
-		return ""
+		return "", nil
 	}
 	t, err := time.Parse(time.RFC3339, switchedAt)
 	if err != nil {
-		return ""
+		return "", nil
 	}
 	if time.Since(t) > switchDriftWindow {
-		return ""
+		return "", nil
 	}
-	return fmt.Sprintf(
+	msg := fmt.Sprintf(
 		"namespace %s switched from class %s to %s (within %s window)",
 		ns.GetName(),
 		prevClass,
 		className,
 		switchDriftWindow.String(),
 	)
+	return msg, &switchDriftHint{namespace: ns.GetName(), prevClass: prevClass}
+}
+
+func readSwitchDriftMode(classObj *unstructured.Unstructured) string {
+	ann := classObj.GetAnnotations()
+	if ann == nil {
+		return switchModeConfirmCurrent
+	}
+	mode := strings.TrimSpace(strings.ToLower(ann[switchDriftModeAnnotation]))
+	if mode == switchModeSuggestRollback {
+		return mode
+	}
+	return switchModeConfirmCurrent
+}
+
+func (w *Watcher) rollbackProposalResources(ctx context.Context, hints []switchDriftHint) ([]any, bool) {
+	if len(hints) == 0 {
+		return nil, false
+	}
+	// If multiple namespaces switched from different classes, keep default mode to avoid mixed proposals.
+	prevClass := hints[0].prevClass
+	for _, h := range hints[1:] {
+		if h.prevClass != prevClass {
+			return nil, false
+		}
+	}
+	u, err := w.dynClient.Resource(schema.GroupVersionResource{Group: "akuity.io", Version: "v1alpha1", Resource: "namespaceclasses"}).
+		Get(ctx, prevClass, metav1.GetOptions{})
+	if err != nil {
+		return nil, false
+	}
+	res, found, _ := unstructured.NestedSlice(u.Object, "spec", "resources")
+	if !found || len(res) == 0 {
+		return nil, false
+	}
+	return res, true
 }
 
 func readSpecResources(item *unstructured.Unstructured) []any {
@@ -335,7 +394,7 @@ func (w *Watcher) writeClassStatus(ctx context.Context, classObj *unstructured.U
 		recs := []any{}
 		if pending {
 			recs = []any{map[string]any{
-				"id":                 fmt.Sprintf("rec-%s", sha([]byte(classObj.GetName()+now))[:12]),
+				"id":                 fmt.Sprintf("rec-%s", sha([]byte(classObj.GetName() + now))[:12]),
 				"status":             "Pending",
 				"createdAt":          now,
 				"summary":            summary,
