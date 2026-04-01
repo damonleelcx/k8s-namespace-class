@@ -430,6 +430,12 @@ This extends the same `multi-kind-demo` / `app-sandbox` setup to exercise **drif
      kubectl annotate namespaceclass multi-kind-demo namespaceclass.akuity.io/require-pull-request=true --overwrite
      ```
 
+     Windows `cmd.exe`:
+
+     ```bat
+     kubectl annotate namespaceclass multi-kind-demo namespaceclass.akuity.io/require-pull-request=true --overwrite
+     ```
+
    - Or cluster-wide: start the manager with `NAMESPACECLASS_REQUIRE_PULL_REQUEST_URL` set to `1`, `true`, or `yes`.
 
 3. **Create drift** the same way as NetworkPolicy flow: temporarily hold auto-heal, then mutate/delete managed objects so watcher can recommend restoring the class template.
@@ -437,6 +443,14 @@ This extends the same `multi-kind-demo` / `app-sandbox` setup to exercise **drif
    ```bash
    kubectl annotate namespaceclass multi-kind-demo namespaceclass.akuity.io/ai-drift-hold-seconds=45 --overwrite
    kubectl -n app-sandbox patch configmap class-config --type merge -p '{"data":{"profile":"tampered-v0","note":"manual-drift"}}'
+   kubectl -n app-sandbox delete serviceaccount app-runner
+   ```
+
+   Windows `cmd.exe` (use **double quotes** around the patch JSON and escape inner `"` as `\"`):
+
+   ```bat
+   kubectl annotate namespaceclass multi-kind-demo namespaceclass.akuity.io/ai-drift-hold-seconds=45 --overwrite
+   kubectl -n app-sandbox patch configmap class-config --type merge -p "{\"data\":{\"profile\":\"tampered-v0\",\"note\":\"manual-drift\"}}"
    kubectl -n app-sandbox delete serviceaccount app-runner
    ```
 
@@ -450,6 +464,7 @@ This extends the same `multi-kind-demo` / `app-sandbox` setup to exercise **drif
    Windows `cmd.exe`:
 
    ```bat
+   kubectl get namespaceclass multi-kind-demo -o yaml
    kubectl get namespaceclass multi-kind-demo -o jsonpath="{.status.recommendations[0].id}"
    ```
 
@@ -459,6 +474,12 @@ This extends the same `multi-kind-demo` / `app-sandbox` setup to exercise **drif
    kubectl apply -f config/samples/namespaceclass-change-request-multikind.yaml
    ```
 
+   Windows `cmd.exe`:
+
+   ```bat
+   kubectl apply -f config\samples\namespaceclass-change-request-multikind.yaml
+   ```
+
 6. Confirm `status.phase` is `Applied`, `status.appliedPullRequestURL` is recorded, `NamespaceClass.spec.resources` reflects the approved proposal, and managed objects are restored from class template (`profile=v1`, `app-runner` exists):
 
    ```bash
@@ -466,6 +487,15 @@ This extends the same `multi-kind-demo` / `app-sandbox` setup to exercise **drif
    kubectl get namespaceclass multi-kind-demo -o yaml
    kubectl -n app-sandbox get serviceaccount app-runner
    kubectl -n app-sandbox get configmap class-config -o jsonpath='{.data.profile}{"\n"}'
+   ```
+
+   Windows `cmd.exe`:
+
+   ```bat
+   kubectl get namespaceclasschangerequest multikind-demo-approval -o yaml
+   kubectl get namespaceclass multi-kind-demo -o yaml
+   kubectl -n app-sandbox get serviceaccount app-runner
+   kubectl -n app-sandbox get configmap class-config -o jsonpath="{.data.profile}"
    ```
 
 **Note:** The model’s `proposedResources` may differ slightly from the checked-in v1 YAML; the approval controller still replaces `spec.resources` with the recommendation. If the change request is `Rejected`, check `status.message` (e.g. high-risk kinds, bad `pullRequestURL`, or `recommendationID` mismatch).
